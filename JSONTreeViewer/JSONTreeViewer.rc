@@ -1,0 +1,9 @@
+// JSONTreeViewer.rc - Resource script
+#include <windows.h>
+
+STRINGTABLE
+BEGIN
+    1  "JSON Tree Viewer"
+END
+
+IDI_MAINICON ICON "JSONTreeViewer.ico"
