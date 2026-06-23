@@ -1,6 +1,8 @@
 // JSONTreeViewer.rc - Resource script
 #include <windows.h>
 
+#define IDI_MAINICON 1001
+
 STRINGTABLE
 BEGIN
     1  "JSON Tree Viewer"

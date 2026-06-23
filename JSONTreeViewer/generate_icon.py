@@ -1,3 +1,4 @@
+from pathlib import Path
 from struct import pack
 
 # Create a simple 16x16 32-bit icon with a blue background and white J shape.
@@ -15,10 +16,12 @@ for y in range(height):
         else:
             pixels.append((0, 120, 215, 255))
 
+image_size = 40 + (width * height * 4) + (width * height // 8)
+
 # ICO header
 icon_data = bytearray()
 icon_data += pack('<3H', 0, 1, 1)
-icon_data += pack('<BBBBHHII', 16, 16, 0, 0, 1, 32, 0, 40 + 4 + 1024)
+icon_data += pack('<BBBBHHII', 16, 16, 0, 0, 1, 32, image_size, 22)
 # BITMAPINFOHEADER
 icon_data += pack('<IIIHHIIIIII', 40, width, height * 2, 1, 32, 0, width * height * 4, 0, 0, 0, 0)
 # Pixel data (bottom-up)
@@ -29,5 +32,6 @@ for y in range(height - 1, -1, -1):
 # Mask data (all zeros)
 icon_data += b'\x00' * (width * height // 8)
 
-with open(r'c:\workspace\VisualCode\JSONTreeViewer\JSONTreeViewer.ico', 'wb') as f:
+icon_path = Path(__file__).with_name('JSONTreeViewer.ico')
+with icon_path.open('wb') as f:
     f.write(icon_data)
