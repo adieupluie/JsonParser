@@ -46,7 +46,17 @@
     <ApplicationIcon>JSONTreeViewer.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
+    <ClCompile Include="FileUtil.cpp" />
+    <ClCompile Include="JsonParser.cpp" />
     <ClCompile Include="JSONTreeViewer.cpp" />
+    <ClCompile Include="TreeViewUtil.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="FileUtil.h" />
+    <ClInclude Include="JsonModel.h" />
+    <ClInclude Include="JsonParser.h" />
+    <ClInclude Include="Resource.h" />
+    <ClInclude Include="TreeViewUtil.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="JSONTreeViewer.rc" />

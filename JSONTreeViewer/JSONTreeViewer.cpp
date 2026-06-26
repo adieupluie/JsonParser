@@ -4,375 +4,45 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <string>
-#include <vector>
-#include <sstream>
+
+#include "FileUtil.h"
+#include "JsonParser.h"
+#include "Resource.h"
+#include "TreeViewUtil.h"
 
 #pragma comment(lib, "Comctl32.lib")
-
-#define IDI_MAINICON 1001
 
 static const wchar_t CLASS_NAME[] = L"JsonTreeViewerWindow";
 static const int SPLITTER_WIDTH = 6;
 static const int MIN_PANE_WIDTH = 120;
+
+enum CommandId {
+    CMD_OPEN = 101,
+    CMD_SAVE = 102,
+    CMD_EXIT = 103,
+    CMD_PARSE = 201,
+    CMD_FIND = 202,
+    CMD_EXPAND_ALL = 203,
+    CMD_COLLAPSE_ALL = 204,
+    CMD_SELECT_ALL = 301,
+    CMD_GO_TO_ERROR = 302,
+};
+
 static HWND g_hEdit = nullptr;
 static HWND g_hTree = nullptr;
 static HWND g_hStatus = nullptr;
+static HWND g_hSearchEdit = nullptr;
 static HACCEL g_hAccel = nullptr;
 static int g_splitX = -1;
 static bool g_isDraggingSplitter = false;
+static bool g_searchVisible = false;
+static bool g_hasLastError = false;
+static int g_lastErrorLine = 1;
+static int g_lastErrorColumn = 1;
+static std::wstring g_lastSearch;
 
-struct JsonNode {
-    std::wstring name;
-    std::wstring value;
-    std::wstring type;
-    std::vector<JsonNode> children;
-};
-
-struct ParseError {
-    bool hasError = false;
-    std::wstring message;
-    int line = 1;
-    int column = 1;
-};
-
-class JsonParser {
-public:
-    JsonParser(const std::wstring& input) : data(input), pos(0), line(1), column(1) {}
-
-    JsonNode parse(ParseError& error) {
-        skipWhitespace();
-        JsonNode root;
-        if (!parseValue(root, error)) {
-            return root;
-        }
-        skipWhitespace();
-        if (pos < data.size()) {
-            setError(error, L"Unexpected characters after JSON value");
-        }
-        return root;
-    }
-
-private:
-    const std::wstring& data;
-    size_t pos;
-    int line;
-    int column;
-
-    bool parseValue(JsonNode& node, ParseError& error) {
-        skipWhitespace();
-        if (pos >= data.size()) {
-            setError(error, L"Unexpected end of input");
-            return false;
-        }
-        wchar_t ch = data[pos];
-        if (ch == L'{') {
-            node.type = L"object";
-            return parseObject(node, error);
-        }
-        if (ch == L'[') {
-            node.type = L"array";
-            return parseArray(node, error);
-        }
-        if (ch == L'\"') {
-            node.type = L"string";
-            return parseString(node.value, error);
-        }
-        if (ch == L't' || ch == L'f' || ch == L'n') {
-            return parseLiteral(node, error);
-        }
-        return parseNumber(node, error);
-    }
-
-    bool parseObject(JsonNode& node, ParseError& error) {
-        if (!consume(L'{', error)) return false;
-        skipWhitespace();
-        if (peek() == L'}') {
-            consume(L'}', error);
-            node.value = L"{}";
-            return true;
-        }
-        while (true) {
-            skipWhitespace();
-            std::wstring key;
-            if (!parseString(key, error)) return false;
-            skipWhitespace();
-            if (!consume(L':', error)) return false;
-            JsonNode child;
-            child.name = key;
-            if (!parseValue(child, error)) return false;
-            node.children.push_back(std::move(child));
-            skipWhitespace();
-            if (peek() == L',') {
-                consume(L',', error);
-                continue;
-            }
-            if (peek() == L'}') {
-                consume(L'}', error);
-                break;
-            }
-            setError(error, L"Expected ',' or '}' in object");
-            return false;
-        }
-        node.value = L"{" + std::to_wstring(node.children.size()) + L" members}";
-        return true;
-    }
-
-    bool parseArray(JsonNode& node, ParseError& error) {
-        if (!consume(L'[', error)) return false;
-        skipWhitespace();
-        if (peek() == L']') {
-            consume(L']', error);
-            node.value = L"[]";
-            return true;
-        }
-        int index = 0;
-        while (true) {
-            JsonNode child;
-            child.name = std::to_wstring(index++);
-            if (!parseValue(child, error)) return false;
-            node.children.push_back(std::move(child));
-            skipWhitespace();
-            if (peek() == L',') {
-                consume(L',', error);
-                continue;
-            }
-            if (peek() == L']') {
-                consume(L']', error);
-                break;
-            }
-            setError(error, L"Expected ',' or ']' in array");
-            return false;
-        }
-        node.value = L"[" + std::to_wstring(node.children.size()) + L" items]";
-        return true;
-    }
-
-    bool parseString(std::wstring& out, ParseError& error) {
-        if (!consume(L'"', error)) return false;
-        std::wstring ss;
-        while (pos < data.size()) {
-            wchar_t ch = data[pos++];
-            advancePosition(ch);
-            if (ch == L'\"') {
-                out = ss;
-                return true;
-            }
-            if (ch == L'\\') {
-                if (pos >= data.size()) break;
-                wchar_t esc = data[pos++];
-                advancePosition(esc);
-                switch (esc) {
-                case L'\"': ss.push_back(L'\"'); break;
-                case L'\\': ss.push_back(L'\\'); break;
-                case L'/': ss.push_back(L'/'); break;
-                case L'b': ss.push_back(L'\b'); break;
-                case L'f': ss.push_back(L'\f'); break;
-                case L'n': ss.push_back(L'\n'); break;
-                case L'r': ss.push_back(L'\r'); break;
-                case L't': ss.push_back(L'\t'); break;
-                case L'u': {
-                    unsigned int code = 0;
-                    for (int i = 0; i < 4; ++i) {
-                        if (pos >= data.size()) {
-                            setError(error, L"Invalid Unicode escape in string");
-                            return false;
-                        }
-                        wchar_t digit = data[pos++];
-                        advancePosition(digit);
-                        int value = hexDigitValue(digit);
-                        if (value < 0) {
-                            setError(error, L"Invalid Unicode escape in string");
-                            return false;
-                        }
-                        code = (code << 4) | value;
-                    }
-                    if (code >= 0xD800 && code <= 0xDBFF) {
-                        if (pos + 1 < data.size() && data[pos] == L'\\' && data[pos + 1] == L'u') {
-                            pos += 2;
-                            advancePosition(L'\\');
-                            advancePosition(L'u');
-                            unsigned int low = 0;
-                            for (int i = 0; i < 4; ++i) {
-                                if (pos >= data.size()) {
-                                    setError(error, L"Invalid Unicode surrogate escape in string");
-                                    return false;
-                                }
-                                wchar_t digit = data[pos++];
-                                advancePosition(digit);
-                                int value = hexDigitValue(digit);
-                                if (value < 0) {
-                                    setError(error, L"Invalid Unicode surrogate escape in string");
-                                    return false;
-                                }
-                                low = (low << 4) | value;
-                            }
-                            if (low >= 0xDC00 && low <= 0xDFFF) {
-                                ss.push_back(static_cast<wchar_t>(code));
-                                ss.push_back(static_cast<wchar_t>(low));
-                                break;
-                            }
-                            setError(error, L"Invalid Unicode surrogate pair in string");
-                            return false;
-                        }
-                        setError(error, L"Invalid Unicode surrogate pair in string");
-                        return false;
-                    }
-                    ss.push_back(static_cast<wchar_t>(code));
-                    break;
-                }
-                default:
-                    setError(error, L"Invalid escape sequence in string");
-                    return false;
-                }
-            } else {
-                ss.push_back(ch);
-            }
-        }
-        setError(error, L"Unterminated string literal");
-        return false;
-    }
-
-    bool parseNumber(JsonNode& node, ParseError& error) {
-        size_t start = pos;
-        if (peek() == L'-') advance();
-        if (!iswdigit(peek())) {
-            setError(error, L"Invalid number format");
-            return false;
-        }
-        if (peek() == L'0') {
-            advance();
-        } else {
-            while (iswdigit(peek())) advance();
-        }
-        if (peek() == L'.') {
-            advance();
-            if (!iswdigit(peek())) {
-                setError(error, L"Expected digit after decimal point");
-                return false;
-            }
-            while (iswdigit(peek())) advance();
-        }
-        if (peek() == L'e' || peek() == L'E') {
-            advance();
-            if (peek() == L'+' || peek() == L'-') advance();
-            if (!iswdigit(peek())) {
-                setError(error, L"Expected exponent digits");
-                return false;
-            }
-            while (iswdigit(peek())) advance();
-        }
-        node.type = L"number";
-        node.value = data.substr(start, pos - start);
-        return true;
-    }
-
-    bool parseLiteral(JsonNode& node, ParseError& error) {
-        if (match(L"true")) {
-            node.type = L"boolean";
-            node.value = L"true";
-            return true;
-        }
-        if (match(L"false")) {
-            node.type = L"boolean";
-            node.value = L"false";
-            return true;
-        }
-        if (match(L"null")) {
-            node.type = L"null";
-            node.value = L"null";
-            return true;
-        }
-        setError(error, L"Invalid literal value");
-        return false;
-    }
-
-    bool consume(wchar_t expected, ParseError& error) {
-        if (peek() == expected) {
-            advance();
-            return true;
-        }
-        std::wstring msg = L"Expected '";
-        msg += expected;
-        msg += L"'";
-        setError(error, msg);
-        return false;
-    }
-
-    wchar_t peek() const {
-        return pos < data.size() ? data[pos] : L'\0';
-    }
-
-    void advance() {
-        if (pos < data.size()) {
-            advancePosition(data[pos]);
-            pos++;
-        }
-    }
-
-    void advancePosition(wchar_t ch) {
-        if (ch == L'\n') {
-            line++;
-            column = 1;
-        } else {
-            column++;
-        }
-    }
-
-    void skipWhitespace() {
-        while (pos < data.size() && iswspace(data[pos])) {
-            advance();
-        }
-    }
-
-    bool match(const wchar_t* expected) {
-        size_t len = wcslen(expected);
-        if (data.substr(pos, len) == expected) {
-            for (size_t i = 0; i < len; ++i) advance();
-            return true;
-        }
-        return false;
-    }
-
-    int hexDigitValue(wchar_t ch) const {
-        if (ch >= L'0' && ch <= L'9') return ch - L'0';
-        if (ch >= L'a' && ch <= L'f') return ch - L'a' + 10;
-        if (ch >= L'A' && ch <= L'F') return ch - L'A' + 10;
-        return -1;
-    }
-
-    void setError(ParseError& error, const std::wstring& message) {
-        if (!error.hasError) {
-            error.hasError = true;
-            error.message = message;
-            error.line = line;
-            error.column = column;
-        }
-    }
-};
-
-void AddTreeNode(HWND hTree, HTREEITEM hParent, const JsonNode& node) {
-    TVINSERTSTRUCT tvis = {};
-    std::wstring label = node.name.empty() ? L"(root)" : node.name;
-    if (!node.type.empty()) {
-        label += L" : ";
-        label += node.type;
-    }
-    if (!node.value.empty() && node.children.empty()) {
-        label += L" = ";
-        label += node.value;
-    }
-    tvis.hParent = hParent;
-    tvis.hInsertAfter = TVI_LAST;
-    tvis.item.mask = TVIF_TEXT;
-    tvis.item.pszText = const_cast<LPWSTR>(label.c_str());
-    HTREEITEM hItem = (HTREEITEM)SendMessage(hTree, TVM_INSERTITEM, 0, (LPARAM)&tvis);
-    for (const JsonNode& child : node.children) {
-        AddTreeNode(hTree, hItem, child);
-    }
-}
-
-void SetStatusText(const std::wstring& text) {
-    SendMessage(g_hStatus, SB_SETTEXT, 0, (LPARAM)text.c_str());
+static void SetStatusText(const std::wstring& text) {
+    SendMessageW(g_hStatus, SB_SETTEXT, 0, reinterpret_cast<LPARAM>(text.c_str()));
 }
 
 static std::wstring GetCurrentTimeText() {
@@ -382,6 +52,48 @@ static std::wstring GetCurrentTimeText() {
     wchar_t buffer[32];
     swprintf_s(buffer, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
     return buffer;
+}
+
+static std::wstring GetEditText() {
+    int length = GetWindowTextLengthW(g_hEdit);
+    std::wstring text(length + 1, L'\0');
+    if (length > 0) {
+        GetWindowTextW(g_hEdit, &text[0], static_cast<int>(text.size()));
+    }
+    text.resize(length);
+    return text;
+}
+
+static int GetTextOffsetForLineColumn(const std::wstring& text, int line, int column) {
+    int currentLine = 1;
+    int currentColumn = 1;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (currentLine == line && currentColumn == column) {
+            return static_cast<int>(i);
+        }
+        if (text[i] == L'\n') {
+            ++currentLine;
+            currentColumn = 1;
+        } else {
+            ++currentColumn;
+        }
+    }
+    return static_cast<int>(text.size());
+}
+
+static void GoToLastError() {
+    if (!g_hasLastError) {
+        SetStatusText(L"No parse error to navigate to");
+        return;
+    }
+
+    std::wstring text = GetEditText();
+    int offset = GetTextOffsetForLineColumn(text, g_lastErrorLine, g_lastErrorColumn);
+    SetFocus(g_hEdit);
+    SendMessageW(g_hEdit, EM_SETSEL, offset, offset);
+    SendMessageW(g_hEdit, EM_SCROLLCARET, 0, 0);
+    SetStatusText(L"Moved to last error at line " + std::to_wstring(g_lastErrorLine) +
+        L", col " + std::to_wstring(g_lastErrorColumn));
 }
 
 static int ClampSplitX(int splitX, int width) {
@@ -402,18 +114,19 @@ static RECT GetSplitterRect(HWND hwnd) {
         statusHeight = rcStatus.bottom - rcStatus.top;
     }
     int width = rcClient.right - rcClient.left;
-    int height = rcClient.bottom - rcClient.top - statusHeight;
+    int searchHeight = g_searchVisible ? 28 : 0;
+    int height = rcClient.bottom - rcClient.top - statusHeight - searchHeight;
     if (g_splitX < 0) {
         g_splitX = ClampSplitX((width - SPLITTER_WIDTH) / 2, width);
     }
     g_splitX = ClampSplitX(g_splitX, width);
-    return RECT{ g_splitX, 0, g_splitX + SPLITTER_WIDTH, max(0, height) };
+    return RECT{ g_splitX, searchHeight, g_splitX + SPLITTER_WIDTH, searchHeight + max(0, height) };
 }
 
 static void LayoutChildren(HWND hwnd) {
     if (!g_hEdit || !g_hTree || !g_hStatus) return;
 
-    SendMessage(g_hStatus, WM_SIZE, 0, 0);
+    SendMessageW(g_hStatus, WM_SIZE, 0, 0);
 
     RECT rcClient;
     GetClientRect(hwnd, &rcClient);
@@ -422,15 +135,18 @@ static void LayoutChildren(HWND hwnd) {
 
     int width = rcClient.right - rcClient.left;
     int statusHeight = rcStatus.bottom - rcStatus.top;
-    int height = max(0, rcClient.bottom - rcClient.top - statusHeight);
+    int searchHeight = g_searchVisible ? 28 : 0;
+    int height = max(0, rcClient.bottom - rcClient.top - statusHeight - searchHeight);
     if (g_splitX < 0) {
         g_splitX = (width - SPLITTER_WIDTH) / 2;
     }
     g_splitX = ClampSplitX(g_splitX, width);
 
     int treeX = g_splitX + SPLITTER_WIDTH;
-    MoveWindow(g_hEdit, 0, 0, g_splitX, height, TRUE);
-    MoveWindow(g_hTree, treeX, 0, max(0, width - treeX), height, TRUE);
+    ShowWindow(g_hSearchEdit, g_searchVisible ? SW_SHOW : SW_HIDE);
+    MoveWindow(g_hSearchEdit, 0, 0, width, searchHeight, TRUE);
+    MoveWindow(g_hEdit, 0, searchHeight, g_splitX, height, TRUE);
+    MoveWindow(g_hTree, treeX, searchHeight, max(0, width - treeX), height, TRUE);
 
     RECT splitter = GetSplitterRect(hwnd);
     InvalidateRect(hwnd, &splitter, TRUE);
@@ -451,102 +167,92 @@ static void DrawSplitter(HWND hwnd, HDC hdc) {
     DeleteObject(pen);
 }
 
-static bool ReadFileToWString(const wchar_t* fileName, std::wstring& out) {
-    HANDLE hFile = CreateFileW(fileName, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return false;
+static bool FindNextInEditor(const std::wstring& query) {
+    std::wstring text = GetEditText();
+    if (query.empty() || text.empty()) return false;
 
-    DWORD size = GetFileSize(hFile, nullptr);
-    if (size == INVALID_FILE_SIZE) {
-        CloseHandle(hFile);
-        return false;
-    }
+    DWORD start = 0;
+    DWORD end = 0;
+    SendMessageW(g_hEdit, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
 
-    if (size == 0) {
-        out.clear();
-        CloseHandle(hFile);
-        return true;
+    size_t found = text.find(query, max(start, end));
+    if (found == std::wstring::npos) {
+        found = text.find(query);
     }
+    if (found == std::wstring::npos) return false;
 
-    std::vector<BYTE> buffer(size);
-    DWORD read = 0;
-    bool ok = ReadFile(hFile, buffer.data(), size, &read, nullptr) && read == size;
-    CloseHandle(hFile);
-    if (!ok) return false;
-
-    if (size >= 2 && buffer[0] == 0xFF && buffer[1] == 0xFE) {
-        size_t charCount = (size - 2) / sizeof(wchar_t);
-        out.assign(reinterpret_cast<wchar_t*>(buffer.data() + 2), charCount);
-        return true;
-    }
-    if (size >= 2 && buffer[0] == 0xFE && buffer[1] == 0xFF) {
-        if ((size - 2) % 2 != 0) return false;
-        out.clear();
-        out.reserve((size - 2) / 2);
-        for (DWORD i = 2; i + 1 < size; i += 2) {
-            wchar_t wc = static_cast<wchar_t>((buffer[i] << 8) | buffer[i + 1]);
-            out.push_back(wc);
-        }
-        return true;
-    }
-
-    size_t offset = 0;
-    if (size >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF) {
-        offset = 3;
-    }
-    int chars = MultiByteToWideChar(CP_UTF8, 0,
-        reinterpret_cast<LPCCH>(buffer.data() + offset), static_cast<int>(size - offset),
-        nullptr, 0);
-    if (chars <= 0) return false;
-    out.resize(chars);
-    MultiByteToWideChar(CP_UTF8, 0,
-        reinterpret_cast<LPCCH>(buffer.data() + offset), static_cast<int>(size - offset),
-        &out[0], chars);
+    SetFocus(g_hEdit);
+    SendMessageW(g_hEdit, EM_SETSEL, static_cast<WPARAM>(found), static_cast<LPARAM>(found + query.size()));
+    SendMessageW(g_hEdit, EM_SCROLLCARET, 0, 0);
     return true;
 }
 
-static bool WriteWStringToUtf8File(const wchar_t* fileName, const std::wstring& text) {
-    int utf8Len = 0;
-    if (!text.empty()) {
-        utf8Len = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
-        if (utf8Len <= 0) return false;
+static void DoFindNext() {
+    int length = GetWindowTextLengthW(g_hSearchEdit);
+    std::wstring query(length + 1, L'\0');
+    if (length > 0) {
+        GetWindowTextW(g_hSearchEdit, &query[0], static_cast<int>(query.size()));
     }
-    std::vector<char> buffer(utf8Len);
-    if (utf8Len > 0) {
-        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), buffer.data(), utf8Len, nullptr, nullptr);
-    }
+    query.resize(length);
 
-    HANDLE hFile = CreateFileW(fileName, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return false;
-    DWORD written = 0;
-    bool ok = true;
-    if (utf8Len > 0) {
-        ok = WriteFile(hFile, buffer.data(), static_cast<DWORD>(utf8Len), &written, nullptr) && written == utf8Len;
+    if (query.empty()) {
+        SetStatusText(L"Type a search term");
+        return;
     }
-    CloseHandle(hFile);
-    return ok;
+    g_lastSearch = query;
+
+    if (FindNextInEditor(query)) {
+        SetStatusText(L"Found in editor: " + query);
+        return;
+    }
+    if (SelectNextTreeMatch(g_hTree, query)) {
+        SetFocus(g_hTree);
+        SetStatusText(L"Found in tree: " + query);
+        return;
+    }
+    SetStatusText(L"No matches: " + query);
 }
 
-bool ParseAndDisplayJson(HWND hwnd) {
-    int length = GetWindowTextLengthW(g_hEdit);
-    std::wstring text(length, L' ');
-    GetWindowTextW(g_hEdit, &text[0], length + 1);
+static void ShowFindBar(HWND hwnd) {
+    if (!g_searchVisible) {
+        g_searchVisible = true;
+        LayoutChildren(hwnd);
+    }
+    SetFocus(g_hSearchEdit);
+    SendMessageW(g_hSearchEdit, EM_SETSEL, 0, -1);
+}
+
+static void DoFind(HWND hwnd) {
+    if (g_searchVisible && GetFocus() == g_hSearchEdit) {
+        DoFindNext();
+        return;
+    }
+    ShowFindBar(hwnd);
+}
+
+static bool ParseAndDisplayJson(HWND hwnd) {
     ParseError error;
+    std::wstring text = GetEditText();
     JsonParser parser(text);
     JsonNode root = parser.parse(error);
     TreeView_DeleteAllItems(g_hTree);
     if (error.hasError) {
-        SetStatusText(L"Parse failed: " + error.message + L" (line " + std::to_wstring(error.line) + L", col " + std::to_wstring(error.column) + L")");
+        g_hasLastError = true;
+        g_lastErrorLine = error.line;
+        g_lastErrorColumn = error.column;
+        SetStatusText(L"Parse failed: " + error.message + L" (line " +
+            std::to_wstring(error.line) + L", col " + std::to_wstring(error.column) + L")");
         MessageBoxW(hwnd, error.message.c_str(), L"JSON Parse Error", MB_ICONERROR | MB_OK);
         return false;
     }
+    g_hasLastError = false;
     AddTreeNode(g_hTree, TVI_ROOT, root);
     SetStatusText(L"Parsed successfully - " + GetCurrentTimeText());
     return true;
 }
 
-void DoOpenFile(HWND hwnd) {
-    OPENFILENAME ofn = {};
+static void DoOpenFile(HWND hwnd) {
+    OPENFILENAMEW ofn = {};
     wchar_t fileName[MAX_PATH] = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
@@ -563,8 +269,8 @@ void DoOpenFile(HWND hwnd) {
     }
 }
 
-void DoSaveFile(HWND hwnd) {
-    OPENFILENAME ofn = {};
+static void DoSaveFile(HWND hwnd) {
+    OPENFILENAMEW ofn = {};
     wchar_t fileName[MAX_PATH] = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
@@ -574,14 +280,58 @@ void DoSaveFile(HWND hwnd) {
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     ofn.lpstrTitle = L"Save JSON File";
     if (GetSaveFileNameW(&ofn)) {
-        int length = GetWindowTextLengthW(g_hEdit);
-        std::wstring text(length, L' ');
-        GetWindowTextW(g_hEdit, &text[0], length + 1);
-        WriteWStringToUtf8File(fileName, text);
+        WriteWStringToUtf8File(fileName, GetEditText());
     }
 }
 
-LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+static void CreateMainMenu(HWND hwnd) {
+    HMENU hMenu = CreateMenu();
+    HMENU hFileMenu = CreatePopupMenu();
+    AppendMenuW(hFileMenu, MF_STRING, CMD_OPEN, L"Open...\tCtrl+O");
+    AppendMenuW(hFileMenu, MF_STRING, CMD_SAVE, L"Save...\tCtrl+S");
+    AppendMenuW(hFileMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hFileMenu, MF_STRING, CMD_EXIT, L"Exit");
+    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hFileMenu), L"File");
+
+    HMENU hActionMenu = CreatePopupMenu();
+    AppendMenuW(hActionMenu, MF_STRING, CMD_PARSE, L"Parse JSON\tCtrl+P");
+    AppendMenuW(hActionMenu, MF_STRING, CMD_FIND, L"Find...\tCtrl+F");
+    AppendMenuW(hActionMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hActionMenu, MF_STRING, CMD_EXPAND_ALL, L"Expand All\tCtrl+E");
+    AppendMenuW(hActionMenu, MF_STRING, CMD_COLLAPSE_ALL, L"Collapse All\tCtrl+Shift+E");
+    AppendMenuW(hActionMenu, MF_STRING, CMD_GO_TO_ERROR, L"Go to Error\tF8");
+    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hActionMenu), L"Action");
+
+    SetMenu(hwnd, hMenu);
+}
+
+static void HandleCommand(HWND hwnd, int commandId) {
+    switch (commandId) {
+    case CMD_OPEN: DoOpenFile(hwnd); break;
+    case CMD_SAVE: DoSaveFile(hwnd); break;
+    case CMD_EXIT: PostMessageW(hwnd, WM_CLOSE, 0, 0); break;
+    case CMD_PARSE: ParseAndDisplayJson(hwnd); break;
+    case CMD_FIND: DoFind(hwnd); break;
+    case CMD_EXPAND_ALL:
+        ExpandTree(g_hTree, nullptr, TVE_EXPAND);
+        SetStatusText(L"Expanded all nodes");
+        break;
+    case CMD_COLLAPSE_ALL:
+        ExpandTree(g_hTree, nullptr, TVE_COLLAPSE);
+        SetStatusText(L"Collapsed all nodes");
+        break;
+    case CMD_SELECT_ALL:
+        if (GetFocus() == g_hEdit) {
+            SendMessageW(g_hEdit, EM_SETSEL, 0, -1);
+        }
+        break;
+    case CMD_GO_TO_ERROR:
+        GoToLastError();
+        break;
+    }
+}
+
+static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     case WM_CREATE: {
         INITCOMMONCONTROLSEX icex = {};
@@ -603,27 +353,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
             0, 0, 0, 0, hwnd, nullptr, nullptr, nullptr);
 
-        HMENU hMenu = CreateMenu();
-        HMENU hFileMenu = CreatePopupMenu();
-        AppendMenuW(hFileMenu, MF_STRING, 101, L"Open...\tCtrl+O");
-        AppendMenuW(hFileMenu, MF_STRING, 102, L"Save...\tCtrl+S");
-        AppendMenuW(hFileMenu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(hFileMenu, MF_STRING, 103, L"Exit");
-        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hFileMenu, L"File");
+        g_hSearchEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr,
+            WS_CHILD | ES_AUTOHSCROLL,
+            0, 0, 0, 0, hwnd, nullptr, nullptr, nullptr);
 
-        HMENU hActionMenu = CreatePopupMenu();
-        AppendMenuW(hActionMenu, MF_STRING, 201, L"Parse JSON\tCtrl+P");
-        AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hActionMenu, L"Action");
-        SetMenu(hwnd, hMenu);
-
+        CreateMainMenu(hwnd);
         SetStatusText(L"Ready");
         LayoutChildren(hwnd);
         break;
     }
-    case WM_SIZE: {
+    case WM_SIZE:
         LayoutChildren(hwnd);
         break;
-    }
     case WM_SETCURSOR: {
         if (LOWORD(lParam) == HTCLIENT) {
             POINT pt;
@@ -648,7 +389,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         }
         break;
     }
-    case WM_MOUSEMOVE: {
+    case WM_MOUSEMOVE:
         if (g_isDraggingSplitter) {
             RECT rcClient;
             GetClientRect(hwnd, &rcClient);
@@ -658,7 +399,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
         break;
-    }
     case WM_LBUTTONUP:
         if (g_isDraggingSplitter) {
             g_isDraggingSplitter = false;
@@ -676,41 +416,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         EndPaint(hwnd, &ps);
         return 0;
     }
-    case WM_COMMAND: {
-        switch (LOWORD(wParam)) {
-        case 101: DoOpenFile(hwnd); break;
-        case 102: DoSaveFile(hwnd); break;
-        case 103: PostMessage(hwnd, WM_CLOSE, 0, 0); break;
-        case 201: ParseAndDisplayJson(hwnd); break;
-        case 301:
-            if (GetFocus() == g_hEdit) {
-                SendMessageW(g_hEdit, EM_SETSEL, 0, -1);
-            }
-            break;
+    case WM_COMMAND:
+        HandleCommand(hwnd, LOWORD(wParam));
+        break;
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE && g_searchVisible && GetFocus() == g_hSearchEdit) {
+            g_searchVisible = false;
+            LayoutChildren(hwnd);
+            SetFocus(g_hEdit);
+            return 0;
         }
         break;
-    }
-    case WM_KEYDOWN: {
-        if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) {
-            if (wParam == 'P') {
-                ParseAndDisplayJson(hwnd);
-                return 0;
-            }
-            if (wParam == 'O') {
-                DoOpenFile(hwnd);
-                return 0;
-            }
-            if (wParam == 'S') {
-                DoSaveFile(hwnd);
-                return 0;
-            }
-            if (wParam == 'A' && GetFocus() == g_hEdit) {
-                SendMessageW(g_hEdit, EM_SETSEL, 0, -1);
-                return 0;
-            }
-        }
-        break;
-    }
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -755,10 +471,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hSmallIcon));
 
     ACCEL accel[] = {
-        { FVIRTKEY | FCONTROL, 'P', 201 },
-        { FVIRTKEY | FCONTROL, 'O', 101 },
-        { FVIRTKEY | FCONTROL, 'S', 102 },
-        { FVIRTKEY | FCONTROL, 'A', 301 },
+        { FVIRTKEY | FCONTROL, 'P', CMD_PARSE },
+        { FVIRTKEY | FCONTROL, 'O', CMD_OPEN },
+        { FVIRTKEY | FCONTROL, 'S', CMD_SAVE },
+        { FVIRTKEY | FCONTROL, 'A', CMD_SELECT_ALL },
+        { FVIRTKEY | FCONTROL, 'F', CMD_FIND },
+        { FVIRTKEY | FCONTROL | FSHIFT, 'F', CMD_FIND },
+        { FVIRTKEY | FCONTROL, 'E', CMD_EXPAND_ALL },
+        { FVIRTKEY | FCONTROL | FSHIFT, 'E', CMD_COLLAPSE_ALL },
+        { FVIRTKEY, VK_F8, CMD_GO_TO_ERROR },
     };
     g_hAccel = CreateAcceleratorTableW(accel, ARRAYSIZE(accel));
 
@@ -766,6 +487,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.hwnd == g_hSearchEdit && msg.message == WM_KEYDOWN) {
+            if (msg.wParam == VK_RETURN) {
+                DoFindNext();
+                continue;
+            }
+            if (msg.wParam == VK_ESCAPE) {
+                g_searchVisible = false;
+                LayoutChildren(hwnd);
+                SetFocus(g_hEdit);
+                continue;
+            }
+        }
         if (g_hAccel && TranslateAcceleratorW(hwnd, g_hAccel, &msg)) {
             continue;
         }
